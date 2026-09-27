@@ -25,6 +25,7 @@
 - [트러블슈팅 1: curl이 3번 중 1번만 성공 (VXLAN 체크섬)](#트러블슈팅-1-curl이-3번-중-1번만-성공-vxlan-체크섬)
 - [트러블슈팅 2: 재시작 후 정상화까지 너무 오래 걸림](#트러블슈팅-2-재시작-후-정상화까지-너무-오래-걸림)
 - [노드 장애 실습](#노드-장애-실습)
+- [관련 실습: CI에서 dind를 TLS로 쓰기 (ci-dind)](#관련-실습-ci에서-dind를-tls로-쓰기-ci-dind)
 - [디버깅 명령 모음](#디버깅-명령-모음)
 - [참고 자료](#참고-자료)
 
@@ -71,6 +72,7 @@ swarm-lab/
 ├── docker-compose.yml     # 노드 3개 + lb
 ├── haproxy/haproxy.cfg    # HAProxy 설정
 ├── stacks/whoami.yml      # (선택) docker stack deploy용 예제
+├── ci-dind/               # (별도 실습) CI에서 dind를 TLS로 쓰는 구성
 └── README.md
 ```
 
@@ -146,8 +148,7 @@ docker compose down -v                        # 볼륨까지 삭제: swarm을 �
 | `container_name` | `manager` 등 | `docker exec manager ...`처럼 고정된 이름으로 접근하려고 지정했습니다. |
 | `hostname` | `manager` 등 | swarm은 노드 이름으로 hostname을 씁니다. 지정하지 않으면 `docker node ls`에 무작위 컨테이너 ID가 나옵니다. |
 | `privileged` | `true` | 안쪽 dockerd가 네트워크 네임스페이스, iptables, VXLAN 인터페이스, cgroup, 파일시스템 마운트를 만들려면 커널 권한이 필요합니다. DinD의 필수 조건입니다. |
-| `environment.DOCKER_TLS_CERTDIR` | `""` | 비워 두면 dind 이미지가 TLS 인증서를 만들지 않습니다. 실습 환경이라 TLS를 쓰지 않습니다. |
-| `command` | `["dockerd", "--host=unix:///var/run/docker.sock"]` | dockerd가 **unix 소켓만** 열게 합니다. 없으면 이미지가 `tcp://0.0.0.0:2375`(인증 없는 TCP API)를 자동으로 추가하고, dockerd는 경고를 보여주려고 **시작을 약 15초 늦춥니다.** 이 실습은 모든 조작을 `docker exec`로 하므로 TCP API가 필요 없습니다. [트러블슈팅 2](#원인-b-dockerd의-의도적인-15초-시작-지연-40초--10초) 참고. |
+| `command` | `["dockerd", "--host=unix:///var/run/docker.sock"]` | dockerd가 **unix 소켓만** 열게 합니다. 이 실습은 모든 조작을 `docker exec`로 하므로 TCP API가 필요 없습니다. 처음에는 TLS를 끈 TCP API(2375)가 자동으로 열리면서 dockerd 시작이 **약 15초 지연**되는 문제가 있었습니다. [트러블슈팅 2](#원인-b-dockerd의-의도적인-15초-시작-지연-40초--10초) 참고. |
 | `networks.swarm-net.ipv4_address` | `172.30.0.10/11/12` | IP를 고정합니다. `swarm init --advertise-addr`와 `swarm join`에 쓰는 주소이고, 재시작 후에도 같아야 볼륨에 저장된 swarm 상태가 그대로 유효합니다. |
 | `volumes` | `<node>-data:/var/lib/docker` | 안쪽 dockerd의 데이터(이미지, 컨테이너, **swarm raft 상태**)를 named volume에 보관합니다. `compose down/up` 후에도 swarm과 서비스가 유지되고, 이미지를 다시 받지 않습니다. DinD에서는 `/var/lib/docker`를 컨테이너 자체 파일시스템이 아닌 볼륨에 두는 것이 일반적입니다. |
 
@@ -160,7 +161,23 @@ docker compose down -v                        # 볼륨까지 삭제: swarm을 �
 | unix 소켓 | `/var/run/docker.sock` (파일) | 같은 머신(컨테이너) 안의 프로세스만 |
 | TCP | `tcp://0.0.0.0:2375` | 네트워크로 닿는 누구나 |
 
-`docker exec manager docker node ls`를 실행하면 **manager 컨테이너 안의** docker CLI가 기본값인 unix 소켓으로 안쪽 dockerd에 붙습니다. 그래서 2375는 한 번도 쓰이지 않습니다. swarm 노드끼리도 2375가 아니라 2377, 7946, 4789를 씁니다.
+`docker exec manager docker node ls`를 실행하면 **manager 컨테이너 안의** docker CLI가 기본값인 unix 소켓으로 안쪽 dockerd에 붙습니다. 그래서 TCP API는 한 번도 쓰이지 않습니다. swarm 노드끼리도 API 포트가 아니라 2377, 7946, 4789를 씁니다.
+
+#### `DOCKER_TLS_CERTDIR`를 설정하지 않는 이유
+
+dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)는 **인자가 없거나 `-`로 시작할 때만** 기본 인자를 붙입니다. `DOCKER_TLS_CERTDIR`는 이때 동작을 정합니다.
+
+| `DOCKER_TLS_CERTDIR` | entrypoint가 붙이는 인자 |
+|---|---|
+| `/certs` (이미지 기본값) | 인증서 자동 생성 + `tcp://0.0.0.0:2376 --tlsverify` |
+| `""` (빈 값) | `tcp://0.0.0.0:2375` (TLS 없음) → 15초 시작 지연 |
+
+이 실습은 `command`를 `dockerd ...`로 직접 지정하므로 이 분기를 건너뜁니다. 그래서 `DOCKER_TLS_CERTDIR`는 아무 영향이 없어 compose에서 뺐습니다. 실제로 빼고 확인한 결과는 다음과 같습니다.
+- dockerd 인자가 `--host=unix:///var/run/docker.sock` 하나뿐입니다.
+- 인증서가 생성되지 않습니다(`/certs/client`는 이미지에 있는 빈 디렉터리).
+- 15초 지연 로그가 0건입니다.
+
+CLI와 dockerd가 **다른 컨테이너**에 있는 CI 환경에서는 TCP가 필요하므로 이야기가 달라집니다. [ci-dind](#관련-실습-ci에서-dind를-tls로-쓰기-ci-dind) 참고.
 
 ### docker-compose.yml: manager 전용
 
@@ -493,13 +510,15 @@ You can override this by explicitly specifying '--tls=false' or '--tlsverify=fal
 ```
 
 **원인**
-- `DOCKER_TLS_CERTDIR: ""`이면 dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)가 `--host=tcp://0.0.0.0:2375`를 자동으로 붙입니다.
+- 당시 compose에는 `DOCKER_TLS_CERTDIR: ""`만 있고 `command`가 없었습니다.
+- 이 경우 dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)가 `--host=tcp://0.0.0.0:2375`를 자동으로 붙입니다.
 - TLS 없이 TCP로 API를 열면 dockerd가 경고를 보여주려고 **일부러 시작을 늦춥니다.**
 - 원인 A를 고치느라 worker가 manager를 기다리게 되면서, 이 지연이 **manager 한 번 + worker 한 번**으로 두 번 쌓였습니다.
 
 **해결**
 - `command: ["dockerd", "--host=unix:///var/run/docker.sock"]`로 TCP API를 아예 열지 않았습니다.
 - 경고 메시지가 안내하는 `--tls=false`로도 지연을 끌 수 있지만, 쓰지 않는 인증 없는 root API를 열어 둘 이유가 없어서 닫는 쪽을 택했습니다.
+- `command`를 직접 지정하면 entrypoint가 기본 인자를 붙이지 않으므로, 이후 `DOCKER_TLS_CERTDIR: ""`도 compose에서 뺐습니다. 빼고 다시 측정해도 재시작 후 세 replica가 모두 응답하기까지 11초였습니다.
 
 ### 남은 약 5초
 
@@ -547,6 +566,24 @@ worker1이 죽었을 때 (manager도 같은 원리)
 **알아둘 점**
 - 이 구성은 **manager가 1대**입니다. manager가 멈춘 동안에는 swarm 관리 기능(`service create/update/scale`, 죽은 task 재배치)이 동작하지 않습니다. 이미 떠 있는 worker의 replica는 계속 응답합니다.
 - manager 장애에도 관리 기능을 유지하려면 manager를 3대 이상 홀수로 두어 raft 과반수를 확보해야 합니다.
+
+---
+
+## 관련 실습: CI에서 dind를 TLS로 쓰기 (ci-dind)
+
+이 실습에서는 CLI와 dockerd가 같은 컨테이너에 있어 unix 소켓으로 충분했습니다. 하지만 CI(예: CI job 컨테이너 + dind 서비스 컨테이너)에서는 둘이 **다른 컨테이너**라 TCP가 필요합니다.
+
+```
+이 실습:  [manager: docker CLI ─unix 소켓─▶ dockerd]          → TCP 불필요
+CI:       [ci: docker CLI] ──TCP 2376 (TLS)──▶ [dind: dockerd]  → TLS 필요
+```
+
+`ci-dind/`에 **공인 인증서 없이, dind가 자동으로 만드는 사설 CA 인증서**로 TLS를 켜는 구성을 만들어 검증했습니다.
+- 인증서를 공유받은 컨테이너만 `docker build`/`run`에 성공했습니다.
+- 인증서가 없거나 다른 CA의 인증서로 접속하면 거부됐습니다.
+- 주의: 자동 생성된 서버 인증서의 이름 목록에는 `docker`만 있고 서비스 이름은 없어서, 네트워크 별칭 `docker`가 필요했습니다.
+
+자세한 구성과 검증 결과는 [ci-dind/README.md](ci-dind/README.md)를 참고하세요.
 
 ---
 

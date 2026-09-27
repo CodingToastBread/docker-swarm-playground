@@ -1,0 +1,46 @@
+# CI job 컨테이너(ci)가 별도 dind 컨테이너의 dockerd를 TLS로 사용하는 구성.
+# 인증서는 dind가 시작할 때 사설 CA로 자동 생성하고, client 인증서만 ci와 공유한다.
+services:
+  dind:
+    image: docker:29-dind
+    privileged: true
+    # DOCKER_TLS_CERTDIR는 이미지 기본값(/certs)을 그대로 쓴다.
+    # -> /certs/{ca,server,client} 자동 생성, dockerd는 tcp://0.0.0.0:2376 + --tlsverify로 뜬다.
+    volumes:
+      - dind-certs-client:/certs/client
+      - dind-data:/var/lib/docker
+    networks:
+      ci-net:
+        # 자동 생성되는 서버 인증서의 SAN은 docker / localhost / 컨테이너 ID뿐이라
+        # 서비스 이름(dind)으로 접속하면 TLS 검증이 실패한다. 인증서에 있는 이름으로 별칭을 준다.
+        aliases:
+          - docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  ci:
+    image: docker:29-cli
+    command: ["sleep", "infinity"]
+    environment:
+      DOCKER_HOST: tcp://docker:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+    volumes:
+      - dind-certs-client:/certs/client:ro
+      - ./app:/workspace:ro
+    working_dir: /workspace
+    networks:
+      - ci-net
+    depends_on:
+      dind:
+        condition: service_healthy
+
+networks:
+  ci-net:
+
+volumes:
+  dind-certs-client:
+  dind-data:

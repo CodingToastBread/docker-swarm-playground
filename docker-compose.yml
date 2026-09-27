@@ -4,8 +4,6 @@ services:
     container_name: manager
     hostname: manager
     privileged: true
-    environment:
-      DOCKER_TLS_CERTDIR: ""
     # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
     # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
     command: ["dockerd", "--host=unix:///var/run/docker.sock"]
@@ -29,8 +27,6 @@ services:
     container_name: worker1
     hostname: worker1
     privileged: true
-    environment:
-      DOCKER_TLS_CERTDIR: ""
     # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
     # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
     command: ["dockerd", "--host=unix:///var/run/docker.sock"]
@@ -48,8 +44,6 @@ services:
     container_name: worker2
     hostname: worker2
     privileged: true
-    environment:
-      DOCKER_TLS_CERTDIR: ""
     # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
     # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
     command: ["dockerd", "--host=unix:///var/run/docker.sock"]
