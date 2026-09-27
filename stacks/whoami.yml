@@ -1,0 +1,21 @@
+# swarm 내부에 배포할 데모 스택 (manager 컨테이너 안에서 docker stack deploy)
+services:
+  whoami:
+    image: traefik/whoami:latest   # 요청을 처리한 컨테이너의 hostname/IP 를 응답
+    ports:
+      - "8080:80"                  # ingress routing mesh: 모든 노드의 8080 -> 서비스 80
+    networks:
+      - app-net
+    deploy:
+      replicas: 6
+      placement:
+        max_replicas_per_node: 2   # 3개 노드에 골고루 퍼지게
+      update_config:
+        parallelism: 2
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+
+networks:
+  app-net:
+    driver: overlay

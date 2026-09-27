@@ -1,0 +1,94 @@
+services:
+  manager:
+    image: docker:29-dind
+    container_name: manager
+    hostname: manager
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
+    # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
+    command: ["dockerd", "--host=unix:///var/run/docker.sock"]
+    networks:
+      swarm-net:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ./stacks:/stacks
+      - manager-data:/var/lib/docker
+    # 재시작 시 worker가 manager의 gossip(7946)보다 먼저 붙으면 join이 실패하고
+    # 60초 주기 재시도까지 worker task가 ingress LB에 등록되지 않는다.
+    # dockerd가 떠 있고, swarm 상태라면 7946까지 열린 뒤에 healthy로 판정한다.
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 && { [ \"$$(docker info --format '{{.Swarm.LocalNodeState}}')\" != active ] || nc -z 127.0.0.1 7946; }"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  worker1:
+    image: docker:29-dind
+    container_name: worker1
+    hostname: worker1
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
+    # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
+    command: ["dockerd", "--host=unix:///var/run/docker.sock"]
+    networks:
+      swarm-net:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - worker1-data:/var/lib/docker
+    depends_on:
+      manager:
+        condition: service_healthy
+
+  worker2:
+    image: docker:29-dind
+    container_name: worker2
+    hostname: worker2
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    # TLS 없이 tcp://0.0.0.0:2375를 열면 dockerd가 경고용으로 시작을 ~15초 지연시킨다.
+    # docker exec(unix 소켓)만 쓰므로 TCP API는 열지 않는다.
+    command: ["dockerd", "--host=unix:///var/run/docker.sock"]
+    networks:
+      swarm-net:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - worker2-data:/var/lib/docker
+    depends_on:
+      manager:
+        condition: service_healthy
+
+  # Docker Desktop의 포트포워딩은 TCP 체크섬을 채우지 않은 패킷(0x0000)을 넘겨서,
+  # ingress가 다른 노드로 VXLAN 전달하면 수신 노드에서 drop된다.
+  # HAProxy가 TCP를 종료하고 새 연결로 넘겨 정상 체크섬을 보장하고,
+  # 세 노드로 분산 + health check로 노드 장애 시 자동 제외한다.
+  lb:
+    image: haproxy:3.2-alpine
+    container_name: lb
+    networks:
+      swarm-net:
+        ipv4_address: 172.30.0.2
+    ports:
+      - "8080:8080"   # 서비스
+      - "8404:8404"   # 통계 페이지
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - manager
+      - worker1
+      - worker2
+
+networks:
+  swarm-net:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  manager-data:
+  worker1-data:
+  worker2-data:
