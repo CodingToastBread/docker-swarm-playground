@@ -24,7 +24,7 @@
 swarm-http/
 ├── docker-compose.yml     # 노드 3개 + lb
 ├── haproxy/haproxy.cfg
-├── stacks/whoami.yml      # (선택) docker stack deploy 예제
+├── stacks/whoami.yml      # stack 예제 (manager의 /stacks에 마운트)
 └── certs/manager-client/  # manager API 클라이언트 인증서 (자동 생성, git 제외)
 ```
 
@@ -32,30 +32,42 @@ swarm-http/
 
 ```bash
 cd swarm-http
-docker compose up -d
-docker exec manager docker info                          # 에러 없으면 준비 완료
+docker compose up -d                                      # manager, worker1, worker2, lb 실행
+docker exec manager docker info                           # 에러 없으면 dockerd 준비 완료
 
+# 1. swarm 구성
 docker exec manager docker swarm init --advertise-addr 172.30.0.10
-docker exec manager docker swarm join-token -q worker    # 토큰 복사
-docker exec worker1 docker swarm join --token <토큰> 172.30.0.10:2377
-docker exec worker2 docker swarm join --token <토큰> 172.30.0.10:2377
-docker exec manager docker node ls                       # 3개 모두 Ready
+TOKEN=$(docker exec manager docker swarm join-token -q worker)
+docker exec worker1 docker swarm join --token $TOKEN 172.30.0.10:2377
+docker exec worker2 docker swarm join --token $TOKEN 172.30.0.10:2377
+docker exec manager docker node ls                        # 확인: 노드 3개 Ready, manager가 Leader
 
+# 2. service 배포
 docker exec manager docker service create --name web --replicas 3 -p 8080:80 traefik/whoami
-docker exec manager docker service ps web
+docker exec manager docker service ps web                 # 확인: 노드마다 replica 1개씩
+curl localhost:8080                                       # 확인: 반복하면 Hostname이 바뀜
+                                                          # 확인: http://localhost:8404 에서 노드 3개 UP
 
-curl localhost:8080                                      # 여러 번 실행하면 Hostname이 바뀜
-# 통계 페이지: http://localhost:8404
-```
+# 3. stack 배포 (8080을 같이 쓰므로 web을 먼저 지움)
+docker exec manager docker service rm web
+docker exec manager docker stack deploy -c /stacks/whoami.yml demo
+docker exec manager docker stack services demo            # 확인: demo_whoami 6/6 (max 2 per node)
+docker exec manager docker stack ps demo                  # 확인: 노드마다 2개씩
+curl localhost:8080                                       # 확인: Hostname 6종류가 섞여 나옴
+docker exec manager docker stack rm demo                  # 정리: 서비스와 네트워크가 함께 삭제됨
 
-```bash
-docker compose down && docker compose up -d   # 재시작 (swarm/서비스 유지)
-docker compose down -v                        # 초기화 (swarm, 인증서 모두 새로)
+# 재시작 / 초기화
+docker compose down && docker compose up -d               # swarm과 서비스 유지
+docker compose down -v                                    # 전부 삭제 (swarm, 인증서 새로 만들어짐)
 ```
 
 - Hostname 순서가 A → B → C로 돌지 않고 섞여 나오는 건 정상입니다([두 단계 분산](#두-단계-분산)).
 - `docker info`의 Driver가 `overlayfs`로 나오는 것도 정상입니다(containerd snapshotter 사용).
-- 스택 배포: `docker exec manager docker stack deploy -c /stacks/whoami.yml demo` (8080을 쓰므로 `web` 서비스를 먼저 지워야 함)
+
+### service와 stack
+
+- **service**: 같은 이미지로 띄우는 컨테이너 묶음입니다. replica 수와 포트를 정해 두면 swarm이 노드에 나눠 배치하고 개수를 유지합니다.
+- **stack**: compose 파일 하나에 적은 여러 service와 네트워크, 볼륨을 한 번에 배포하는 단위입니다. 이름이 앞에 붙고(`demo_whoami`), `build:`는 지원하지 않아 이미지가 미리 있어야 합니다.
 
 ## 구성 설명
 
