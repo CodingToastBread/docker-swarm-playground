@@ -42,12 +42,18 @@ docker exec worker2 docker swarm join --token $TOKEN 172.30.0.10:2377
 docker exec manager docker node ls                        # 확인: 노드 3개 Ready, manager가 Leader
 
 # 2. service 배포
-docker exec manager docker service create --name web --replicas 3 -p 8080:80 traefik/whoami
+docker exec manager docker service create --name web --replicas 3 -p 8080:80 traefik/whoami:v1.11
 docker exec manager docker service ps web                 # 확인: 노드마다 replica 1개씩
 curl localhost:8080                                       # 확인: 반복하면 Hostname이 바뀜
                                                           # 확인: http://localhost:8404 에서 노드 3개 UP
 
-# 3. stack 배포 (8080을 같이 쓰므로 web을 먼저 지움)
+# 3. 롤링 업데이트 (다른 터미널에서 curl을 반복해 두면 요청이 끊기지 않는 걸 볼 수 있음)
+docker exec manager docker service update --image traefik/whoami:v1.12 \
+  --update-parallelism 1 --update-delay 5s web            # 1개씩, 5초 간격으로 교체
+docker exec manager docker service ps web                 # 확인: v1.11은 Shutdown, v1.12가 Running
+docker exec manager docker service rollback web           # 확인: 다시 v1.11로 돌아감
+
+# 4. stack 배포 (8080을 같이 쓰므로 web을 먼저 지움)
 docker exec manager docker service rm web
 docker exec manager docker stack deploy -c /stacks/whoami.yml demo
 docker exec manager docker stack services demo            # 확인: demo_whoami 6/6 (max 2 per node)
@@ -63,9 +69,10 @@ docker compose down -v                                    # 전부 삭제 (swarm
 - Hostname 순서가 A → B → C로 돌지 않고 섞여 나오는 건 정상입니다([두 단계 분산](#두-단계-분산)).
 - `docker info`의 Driver가 `overlayfs`로 나오는 것도 정상입니다(containerd snapshotter 사용).
 
-### service와 stack
+### service, 롤링 업데이트, stack
 
 - **service**: 같은 이미지로 띄우는 컨테이너 묶음입니다. replica 수와 포트를 정해 두면 swarm이 노드에 나눠 배치하고 개수를 유지합니다.
+- **롤링 업데이트**: service의 이미지나 설정을 바꾸면 replica를 정해진 개수씩 차례로 교체합니다. 나머지 replica가 계속 응답하므로 서비스가 끊기지 않고, `rollback`으로 이전 설정으로 되돌릴 수 있습니다.
 - **stack**: compose 파일 하나에 적은 여러 service와 네트워크, 볼륨을 한 번에 배포하는 단위입니다. 이름이 앞에 붙고(`demo_whoami`), `build:`는 지원하지 않아 이미지가 미리 있어야 합니다.
 
 ## 구성 설명
