@@ -5,7 +5,7 @@
 | 디렉터리 | 내용 |
 |---|---|
 | [`swarm-http/`](swarm-http/README.md) | DinD 노드 3개(manager 1 + worker 2)로 swarm을 만들고, HAProxy를 앞에 둬서 HTTP 서비스를 분산합니다. routing mesh 개념, VXLAN 체크섬 문제, 재시작 지연 해결, 노드 장애 실습, manager Docker API의 TLS 원격 접속을 다룹니다. |
-| [`ci-dind/`](ci-dind/README.md) | CI job 컨테이너가 별도 dind 컨테이너의 dockerd를 TLS(자동 생성 사설 인증서)로 사용하는 구성입니다. `docker build`/`run`과 인증서 없는 접속 거부를 검증했습니다. |
+| [`ci-dind/`](ci-dind/README.md) | CI job 컨테이너가 별도 dind 컨테이너의 dockerd를 TLS(자동 생성 사설 인증서)로 사용하는 구성입니다. 인증서가 없는 컨테이너는 접속할 수 없습니다. |
 
 ```
 swarm-lab/
