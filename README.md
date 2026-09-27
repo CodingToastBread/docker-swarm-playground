@@ -9,7 +9,9 @@
    - 해결: 앞단에 프록시(HAProxy)를 둬서 TCP 연결을 새로 맺게 했습니다.
 2. **재시작 후 정상화까지 약 1분 45초**
    - 원인: gossip 접속 순서 경쟁과, dockerd가 일부러 넣는 15초 시작 지연이 겹쳤습니다.
-   - 해결: healthcheck, `depends_on`, unix 소켓 전용 설정으로 **약 10초**까지 줄였습니다.
+   - 해결: healthcheck, `depends_on`, dockerd 시작 인자 조정으로 **약 10초**까지 줄였습니다.
+
+또한 이후 CI/CD(레지스트리 push/pull, 원격 배포)로 확장할 것을 고려해, **manager의 Docker API를 TLS(사설 CA 인증서)로 열어** Mac이나 다른 컨테이너에서 원격으로 조작할 수 있게 했습니다.
 
 > 이 문서의 수치와 로그는 모두 아래 환경에서 직접 측정한 값입니다. 직접 확인하지 못하고 추정한 부분은 **(추정)**이라고 표시했습니다.
 
@@ -25,6 +27,7 @@
 - [트러블슈팅 1: curl이 3번 중 1번만 성공 (VXLAN 체크섬)](#트러블슈팅-1-curl이-3번-중-1번만-성공-vxlan-체크섬)
 - [트러블슈팅 2: 재시작 후 정상화까지 너무 오래 걸림](#트러블슈팅-2-재시작-후-정상화까지-너무-오래-걸림)
 - [노드 장애 실습](#노드-장애-실습)
+- [manager 원격 접속 (TLS)](#manager-원격-접속-tls)
 - [관련 실습: CI에서 dind를 TLS로 쓰기 (ci-dind)](#관련-실습-ci에서-dind를-tls로-쓰기-ci-dind)
 - [디버깅 명령 모음](#디버깅-명령-모음)
 - [참고 자료](#참고-자료)
@@ -48,7 +51,7 @@
 
 ```
  Mac  ── localhost:8080 (서비스), localhost:8404 (HAProxy 통계)
-  │
+  │      127.0.0.1:2376 ──────────────────────▶ manager Docker API (TLS, 아래 참고)
   │  Docker Desktop 포트포워딩
   ▼
  ┌──────────────┐              swarm-net: 172.30.0.0/24 (compose 브리지 네트워크)
@@ -73,6 +76,7 @@ swarm-lab/
 ├── haproxy/haproxy.cfg    # HAProxy 설정
 ├── stacks/whoami.yml      # (선택) docker stack deploy용 예제
 ├── ci-dind/               # (별도 실습) CI에서 dind를 TLS로 쓰는 구성
+├── certs/manager-client/  # manager Docker API용 클라이언트 인증서 (자동 생성, git 제외)
 └── README.md
 ```
 
@@ -136,6 +140,8 @@ docker compose down && docker compose up -d   # 볼륨 유지: swarm과 서비�
 docker compose down -v                        # 볼륨까지 삭제: swarm을 처음부터 다시 구성
 ```
 
+`down -v`를 하면 manager의 사설 CA도 새로 만들어집니다. `./certs/manager-client`는 다음 시작 때 새 CA 기준으로 자동 갱신되지만, 그 전에 다른 곳에 복사해 둔 클라이언트 인증서는 더 이상 쓸 수 없습니다. [manager 원격 접속](#인증서-유지-방식) 참고.
+
 ---
 
 ## 파일 구성 설명
@@ -148,22 +154,28 @@ docker compose down -v                        # 볼륨까지 삭제: swarm을 �
 | `container_name` | `manager` 등 | `docker exec manager ...`처럼 고정된 이름으로 접근하려고 지정했습니다. |
 | `hostname` | `manager` 등 | swarm은 노드 이름으로 hostname을 씁니다. 지정하지 않으면 `docker node ls`에 무작위 컨테이너 ID가 나옵니다. |
 | `privileged` | `true` | 안쪽 dockerd가 네트워크 네임스페이스, iptables, VXLAN 인터페이스, cgroup, 파일시스템 마운트를 만들려면 커널 권한이 필요합니다. DinD의 필수 조건입니다. |
-| `command` | `["dockerd", "--host=unix:///var/run/docker.sock"]` | dockerd가 **unix 소켓만** 열게 합니다. 이 실습은 모든 조작을 `docker exec`로 하므로 TCP API가 필요 없습니다. 처음에는 TLS를 끈 TCP API(2375)가 자동으로 열리면서 dockerd 시작이 **약 15초 지연**되는 문제가 있었습니다. [트러블슈팅 2](#원인-b-dockerd의-의도적인-15초-시작-지연-40초--10초) 참고. |
 | `networks.swarm-net.ipv4_address` | `172.30.0.10/11/12` | IP를 고정합니다. `swarm init --advertise-addr`와 `swarm join`에 쓰는 주소이고, 재시작 후에도 같아야 볼륨에 저장된 swarm 상태가 그대로 유효합니다. |
 | `volumes` | `<node>-data:/var/lib/docker` | 안쪽 dockerd의 데이터(이미지, 컨테이너, **swarm raft 상태**)를 named volume에 보관합니다. `compose down/up` 후에도 swarm과 서비스가 유지되고, 이미지를 다시 받지 않습니다. DinD에서는 `/var/lib/docker`를 컨테이너 자체 파일시스템이 아닌 볼륨에 두는 것이 일반적입니다. |
 
-#### `command`를 조금 더 풀어 보면
+#### Docker API 접속 통로: unix 소켓과 TCP
 
 `docker` CLI는 dockerd에 API로 명령을 보내는데, 접속 통로가 두 가지입니다.
 
 | 통로 | 주소 | 접속 가능한 대상 |
 |---|---|---|
 | unix 소켓 | `/var/run/docker.sock` (파일) | 같은 머신(컨테이너) 안의 프로세스만 |
-| TCP | `tcp://0.0.0.0:2375` | 네트워크로 닿는 누구나 |
+| TCP | `tcp://0.0.0.0:2375` (TLS 없음) / `:2376` (TLS) | 네트워크로 닿는 누구나 (TLS면 인증서를 가진 쪽만) |
 
-`docker exec manager docker node ls`를 실행하면 **manager 컨테이너 안의** docker CLI가 기본값인 unix 소켓으로 안쪽 dockerd에 붙습니다. 그래서 TCP API는 한 번도 쓰이지 않습니다. swarm 노드끼리도 API 포트가 아니라 2377, 7946, 4789를 씁니다.
+`docker exec manager docker node ls`를 실행하면 **manager 컨테이너 안의** docker CLI가 기본값인 unix 소켓으로 안쪽 dockerd에 붙습니다. 그래서 `docker exec`로 조작할 때는 TCP API가 필요 없습니다. swarm 노드끼리도 API 포트가 아니라 2377, 7946, 4789를 씁니다.
 
-#### `DOCKER_TLS_CERTDIR`를 설정하지 않는 이유
+이 실습에서는 노드별로 다르게 설정했습니다.
+
+| 노드 | Docker API | 이유 |
+|---|---|---|
+| manager | unix 소켓 + **TCP 2376 (TLS)** | Mac이나 CI 컨테이너에서 원격으로 swarm을 조작(배포 등)하기 위해 |
+| worker1, worker2 | unix 소켓만 | 원격으로 조작할 일이 없으므로 API 포트를 열지 않음 |
+
+#### `command`와 `DOCKER_TLS_CERTDIR`의 관계
 
 dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)는 **인자가 없거나 `-`로 시작할 때만** 기본 인자를 붙입니다. `DOCKER_TLS_CERTDIR`는 이때 동작을 정합니다.
 
@@ -172,17 +184,18 @@ dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)는 **인자가 없거나 `
 | `/certs` (이미지 기본값) | 인증서 자동 생성 + `tcp://0.0.0.0:2376 --tlsverify` |
 | `""` (빈 값) | `tcp://0.0.0.0:2375` (TLS 없음) → 15초 시작 지연 |
 
-이 실습은 `command`를 `dockerd ...`로 직접 지정하므로 이 분기를 건너뜁니다. 그래서 `DOCKER_TLS_CERTDIR`는 아무 영향이 없어 compose에서 뺐습니다. 실제로 빼고 확인한 결과는 다음과 같습니다.
-- dockerd 인자가 `--host=unix:///var/run/docker.sock` 하나뿐입니다.
-- 인증서가 생성되지 않습니다(`/certs/client`는 이미지에 있는 빈 디렉터리).
-- 15초 지연 로그가 0건입니다.
-
-CLI와 dockerd가 **다른 컨테이너**에 있는 CI 환경에서는 TCP가 필요하므로 이야기가 달라집니다. [ci-dind](#관련-실습-ci에서-dind를-tls로-쓰기-ci-dind) 참고.
+- **worker:** `command`를 `dockerd --host=unix:///var/run/docker.sock`로 직접 지정해서 이 분기를 건너뜁니다. `DOCKER_TLS_CERTDIR`는 아무 영향이 없어 설정하지 않았습니다. 확인 결과 dockerd 인자는 unix 소켓 하나뿐이고, 인증서는 생성되지 않았습니다(`/certs/client`는 이미지에 원래 있는 빈 디렉터리).
+- **manager:** `command`를 지정하지 않고 `DOCKER_TLS_CERTDIR=/certs`를 명시해서, entrypoint가 인증서를 만들고 TLS로 2376을 열게 했습니다.
+- `""`(TLS 없는 2375)는 어느 노드에도 쓰지 않습니다.
 
 ### docker-compose.yml: manager 전용
 
 | 항목 | 설명 / 필요한 이유 |
 |---|---|
+| `command` 없음 + `environment.DOCKER_TLS_CERTDIR: /certs` | entrypoint 기본 동작으로 dockerd를 `--host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --tlsverify ...`로 띄웁니다. 인증서는 `/certs`에 사설 CA로 자동 생성합니다. `/certs`는 이미지 기본값이지만 의도를 드러내려고 명시했습니다. |
+| `ports: 127.0.0.1:2376:2376` | Docker API(TLS)를 Mac의 **127.0.0.1에만** 엽니다. 사내망 등 외부에서는 접근할 수 없습니다. |
+| `volumes: manager-certs:/certs` | CA, 서버, 클라이언트의 **개인키**를 named volume에 보관합니다. 컨테이너를 새로 만들어도 같은 키를 쓰므로 기존 클라이언트 인증서가 계속 유효합니다. |
+| `volumes: ./certs/manager-client:/certs/client` | 클라이언트 인증서(`ca.pem`, `cert.pem`, `key.pem`)만 호스트로 꺼냅니다. Mac이나 다른 컨테이너가 이 파일로 접속합니다. CA 개인키는 볼륨 안에만 있습니다. `.gitignore`로 커밋에서 제외합니다. |
 | `volumes: ./stacks:/stacks` | 호스트의 스택 파일을 manager 안에서 `docker stack deploy -c /stacks/...`로 쓰기 위한 마운트입니다. |
 | `healthcheck` | dockerd가 응답하고, swarm 상태라면 **gossip 포트 7946까지 열린 뒤에** healthy로 판정합니다. swarm을 아직 만들지 않은 처음 상태에서는 dockerd만 떠 있으면 통과합니다. |
 
@@ -198,6 +211,7 @@ compose 파일 안에서는 `$`를 `$$`로 써야 compose의 변수 치환을 �
 
 | 항목 | 설명 / 필요한 이유 |
 |---|---|
+| `command` | `["dockerd", "--host=unix:///var/run/docker.sock"]`로 **unix 소켓만** 엽니다. 이게 없고 `DOCKER_TLS_CERTDIR: ""`이던 초기에는 TLS 없는 2375가 자동으로 열리면서 dockerd 시작이 **약 15초 지연**됐습니다. [트러블슈팅 2](#원인-b-dockerd의-의도적인-15초-시작-지연-40초--10초) 참고. |
 | `depends_on.manager.condition: service_healthy` | manager가 healthy가 된 뒤에 worker를 시작합니다. 재시작할 때 worker가 manager의 gossip보다 먼저 접속을 시도해 실패하는 경쟁 상태를 막습니다. [트러블슈팅 2](#원인-a-gossip-접속-순서-경쟁-1분-45초--40초) 참고. |
 
 ### docker-compose.yml: `lb`
@@ -216,7 +230,7 @@ compose 파일 안에서는 `$`를 `$$`로 써야 compose의 변수 치환을 �
 | 항목 | 설명 |
 |---|---|
 | `networks.swarm-net` (subnet `172.30.0.0/24`) | 노드끼리 통신하는 "물리 네트워크" 역할의 브리지 네트워크입니다. 고정 IP를 쓰려면 subnet을 명시해야 합니다. |
-| `volumes` | 노드별 `/var/lib/docker`용 named volume입니다. `docker compose down -v`로 삭제됩니다. |
+| `volumes` | 노드별 `/var/lib/docker`용 volume과 manager의 인증서용 `manager-certs`입니다. `docker compose down -v`로 삭제됩니다. |
 
 swarm이 노드끼리 쓰는 포트는 다음과 같습니다. 같은 compose 네트워크 안에서는 모두 열려 있어 별도 설정이 필요 없습니다.
 
@@ -519,6 +533,7 @@ You can override this by explicitly specifying '--tls=false' or '--tlsverify=fal
 - `command: ["dockerd", "--host=unix:///var/run/docker.sock"]`로 TCP API를 아예 열지 않았습니다.
 - 경고 메시지가 안내하는 `--tls=false`로도 지연을 끌 수 있지만, 쓰지 않는 인증 없는 root API를 열어 둘 이유가 없어서 닫는 쪽을 택했습니다.
 - `command`를 직접 지정하면 entrypoint가 기본 인자를 붙이지 않으므로, 이후 `DOCKER_TLS_CERTDIR: ""`도 compose에서 뺐습니다. 빼고 다시 측정해도 재시작 후 세 replica가 모두 응답하기까지 11초였습니다.
+- 이후 manager는 원격 접속을 위해 TLS(2376)를 켰습니다([manager 원격 접속](#manager-원격-접속-tls)). 지연은 **TLS 없이** TCP를 열 때만 생기므로 TLS에서는 없습니다. 지연 로그 0건, 노드 준비 3초, 재시작 후 세 replica 응답까지 11초로 측정됐습니다.
 
 ### 남은 약 5초
 
@@ -569,12 +584,99 @@ worker1이 죽었을 때 (manager도 같은 원리)
 
 ---
 
-## 관련 실습: CI에서 dind를 TLS로 쓰기 (ci-dind)
+## manager 원격 접속 (TLS)
 
-이 실습에서는 CLI와 dockerd가 같은 컨테이너에 있어 unix 소켓으로 충분했습니다. 하지만 CI(예: CI job 컨테이너 + dind 서비스 컨테이너)에서는 둘이 **다른 컨테이너**라 TCP가 필요합니다.
+`docker exec manager docker ...` 없이, **컨테이너 밖에서** manager의 dockerd를 조작할 수 있게 했습니다. 나중에 CI 파이프라인에서 레지스트리(예: Harbor)로 이미지를 push하고 swarm에 `docker stack deploy`로 배포할 때 필요한 기반입니다.
 
 ```
-이 실습:  [manager: docker CLI ─unix 소켓─▶ dockerd]          → TCP 불필요
+Mac ──127.0.0.1:2376 (TLS)──────────────▶ manager dockerd
+CI 컨테이너 ──tcp://manager:2376 (TLS)──▶ manager dockerd   (swarm-net에 붙은 경우)
+                                         worker는 API 포트 없음
+```
+
+### 사용법
+
+Mac에서 (인증서 경로를 플래그로 지정):
+
+```bash
+C=$PWD/certs/manager-client
+docker -H tcp://127.0.0.1:2376 --tlsverify \
+  --tlscacert $C/ca.pem --tlscert $C/cert.pem --tlskey $C/key.pem \
+  node ls
+```
+
+매번 플래그를 쓰기 번거로우면 docker context로 등록할 수 있습니다. 이 명령은 Mac의 `~/.docker/contexts`에 설정을 추가하므로, 원하는 경우에만 실행하세요. **이 실습에서는 실행하지 않았습니다.**
+
+```bash
+docker context create swarm-lab --docker \
+  "host=tcp://127.0.0.1:2376,ca=$C/ca.pem,cert=$C/cert.pem,key=$C/key.pem"
+docker --context swarm-lab node ls
+```
+
+swarm-net에 붙은 다른 컨테이너에서 (향후 CI 형태):
+
+```bash
+docker run --rm --network swarm-lab_swarm-net \
+  -v $PWD/certs/manager-client:/certs/client:ro \
+  -e DOCKER_HOST=tcp://manager:2376 -e DOCKER_TLS_VERIFY=1 -e DOCKER_CERT_PATH=/certs/client \
+  docker:29-cli docker service ls
+```
+
+### 서버 인증서의 이름 (SAN)
+
+entrypoint가 컨테이너 IP, hostname, `docker`, `localhost`를 자동으로 넣습니다. `hostname: manager`와 고정 IP 덕분에 별도 설정 없이 다음 이름으로 접속할 수 있습니다.
+
+```
+DNS:docker, DNS:localhost, DNS:manager, IP:127.0.0.1, IP:172.30.0.10, IP:::1
+```
+
+다른 이름(예: 도메인)으로 접속해야 하면 `DOCKER_TLS_SAN` 환경변수로 추가할 수 있습니다(entrypoint 코드 기준, 미검증). [ci-dind](#관련-실습-ci에서-dind를-tls로-쓰기-ci-dind)에서는 서비스 이름이 SAN에 없어 검증에 실패한 적이 있습니다.
+
+### 인증서 유지 방식
+
+entrypoint 코드를 확인한 동작입니다.
+- **개인키**(CA, 서버, 클라이언트)는 파일이 있으면 재사용합니다.
+- **인증서**(공개 부분)는 시작할 때마다 같은 키로 다시 서명합니다. IP나 이름 변경, 만료에 대비한 동작입니다.
+
+따라서 `/certs`를 볼륨(`manager-certs`)에 두면, 컨테이너를 새로 만들어도 **신뢰 관계가 유지**됩니다.
+
+| 시나리오 | 결과 (실측) |
+|---|---|
+| `down` → `up --force-recreate` | CA, 서버, 클라이언트 키 지문 동일. 인증서 serial만 바뀜 |
+| 재생성 **전에** 복사해 둔 클라이언트 인증서로 접속 | **성공** |
+| `down -v` 후 재시작 | CA가 새로 생성됨. `./certs/manager-client`는 자동 갱신되어 접속 성공 |
+| `down -v` **전에** 복사해 둔 클라이언트 인증서로 접속 | **실패**: `x509: certificate signed by unknown authority` |
+
+클라이언트 인증서를 다른 곳(예: CI 서버)에 복사해 두었다면, `down -v` 후에는 다시 복사해야 합니다.
+
+### 검증 결과
+
+| 확인 항목 | 결과 |
+|---|---|
+| manager dockerd 인자 | `--host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --tlsverify ...` |
+| worker dockerd 인자 | `--host=unix:///var/run/docker.sock` (변경 없음) |
+| 15초 시작 지연 | 없음 (로그 0건, 노드 준비 3초) |
+| Mac에서 `docker -H tcp://127.0.0.1:2376 --tlsverify ... node ls` | 성공 (노드 3개 Ready) |
+| swarm-net 컨테이너에서 `tcp://manager:2376`로 `service ls` | 성공 |
+| 클라이언트 인증서 없이 접속 (Mac, swarm-net 모두) | **거부** (TLS 핸드셰이크 실패, curl exit 56) |
+| worker의 2375, 2376 포트 | 닫혀 있음 |
+| 포트 공개 범위 (`docker port manager`) | `2376/tcp -> 127.0.0.1:2376` |
+| 서비스 동작 (30회 요청) | 세 replica에 10/10/10회 |
+
+### 앞으로 확장할 때
+
+- **CI 컨테이너에서 배포:** swarm-net에 붙이고 `./certs/manager-client`를 마운트하면 `docker stack deploy`를 할 수 있습니다(위 사용법의 마지막 예시).
+- **레지스트리(Harbor 등):** swarm 노드가 레지스트리에서 이미지를 pull하려면, 노드의 dockerd가 그 레지스트리를 신뢰해야 합니다. 레지스트리의 TLS 인증서 또는 insecure-registry 설정이 필요한데, 이는 이번 Docker API 인증서와는 **별개의 인증서**입니다.
+- **manager를 여러 대로 늘릴 때:** 각 manager에 같은 방식으로 TLS를 켜고, 인증서를 어떻게 공유할지(CA를 하나로 통일할지)를 정해야 합니다.
+
+---
+
+## 관련 실습: CI에서 dind를 TLS로 쓰기 (ci-dind)
+
+이 실습의 노드들은 `docker exec`로 조작하므로 CLI와 dockerd가 같은 컨테이너에 있습니다. 하지만 CI(예: CI job 컨테이너 + dind 서비스 컨테이너)에서는 둘이 **다른 컨테이너**라 TCP가 필요합니다.
+
+```
+docker exec: [manager: docker CLI ─unix 소켓─▶ dockerd]       → TCP 불필요
 CI:       [ci: docker CLI] ──TCP 2376 (TLS)──▶ [dind: dockerd]  → TLS 필요
 ```
 
@@ -609,6 +711,10 @@ curl -s 'localhost:8404/;csv' | awk -F, '$1=="swarm_nodes"{print $2, $18}'
 
 # 특정 노드의 8080으로 직접 요청 (HAProxy 우회)
 docker exec lb wget -qO- http://172.30.0.10:8080
+
+# manager 서버 인증서의 SAN과 키 지문
+docker exec manager openssl x509 -in /certs/server/cert.pem -noout -ext subjectAltName
+docker exec manager sh -c 'openssl pkey -in /certs/ca/key.pem -pubout | sha256sum'
 ```
 
 `apk add`로 설치한 도구는 노드 컨테이너가 다시 만들어지면 사라집니다.
