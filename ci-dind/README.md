@@ -16,7 +16,7 @@ CI job 컨테이너(`ci`)가 별도의 dind 컨테이너(`dind`)에 있는 docke
 CLI와 dockerd가 **다른 컨테이너**에 있으면 둘을 잇는 통로는 TCP뿐입니다. 이때 TLS를 끄면(`DOCKER_TLS_CERTDIR=""`, 2375) 문제가 생깁니다.
 
 - 그 포트에 닿는 누구나 root 권한을 얻습니다.
-- dockerd가 경고를 보여주려고 시작을 **약 15초** 늦춥니다. 상위 [swarm-lab README](../README.md) 트러블슈팅 2 참고.
+- dockerd가 경고를 보여주려고 시작을 **약 15초** 늦춥니다. [swarm-http README](../swarm-http/README.md)의 트러블슈팅 2 참고.
 - 로그에 "향후 버전에서는 hard failure가 된다"는 경고가 나옵니다.
 
 ## 사용법
