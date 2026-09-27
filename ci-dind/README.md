@@ -44,6 +44,58 @@ docker compose down -v                             # 정리 (인증서, 이미�
 | `ci` / `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | 각각 `tcp://docker:2376`, 서버 인증서 검증 켜기, 클라이언트 인증서 위치입니다. |
 | `ports` 없음 | 호스트(Mac)에 포트를 노출하지 않습니다. compose 내부 네트워크(`ci-net`)에서만 접근할 수 있습니다. |
 
+## 인증서 위치와 사용 방법
+
+### 어디서 만들어지고 어디에 있나
+
+dind 컨테이너가 시작될 때 entrypoint가 **컨테이너 안에서** 자동으로 만듭니다. Mac에서 만들어 넣는 게 아닙니다.
+
+```
+dind: /certs
+      ├── ca/      CA 개인키 (dind 컨테이너 안에만, 볼륨으로 보관하지 않음)
+      ├── server/  dind의 dockerd가 사용
+      └── client/  ══ named volume (dind-certs-client) ══▶ ci: /certs/client (읽기 전용)
+```
+
+클라이언트 인증서는 **named volume**에 있어서 Docker Desktop VM 안에 저장됩니다. 그래서 Mac의 `ci-dind/` 디렉터리를 `tree`로 봐도 `.pem` 파일이 보이지 않습니다. [swarm-http](../swarm-http/README.md)가 bind mount로 Mac 디렉터리에 꺼내는 것과 다른 점입니다.
+
+| | swarm-http (manager) | ci-dind |
+|---|---|---|
+| 클라이언트 인증서 마운트 | bind mount (`./certs/manager-client`) | named volume (`dind-certs-client`) |
+| Mac에서 파일이 보임 | 보임 | 안 보임 |
+| 이유 | Mac CLI 등 **컨테이너 밖**에서도 써야 함 | 같은 compose의 `ci`만 쓰면 됨 |
+
+파일을 확인하거나 꺼내야 할 때는 다음처럼 합니다.
+
+```bash
+docker compose exec ci ls -l /certs/client          # ci 컨테이너 안에서 보기
+docker compose cp ci:/certs/client ./certs-copy     # Mac으로 복사 (필요할 때만, 커밋 금지)
+```
+
+### ci 컨테이너에서는 인증서를 따로 지정하지 않음
+
+compose에서 환경변수를 미리 정해 두었으므로, `ci` 안에서는 평소처럼 명령하면 됩니다.
+
+```yaml
+environment:
+  DOCKER_HOST: tcp://docker:2376     # 서버 인증서 SAN에 있는 이름
+  DOCKER_TLS_VERIFY: "1"             # 서버 인증서 검증 + 클라이언트 인증서 제출
+  DOCKER_CERT_PATH: /certs/client    # ca.pem, cert.pem, key.pem 위치
+```
+
+```bash
+docker compose exec ci docker build -t ci-test .   # 플래그 없이 TLS로 dind에 접속
+```
+
+CI 도구(GitLab CI, Jenkins 등)에서도 같은 세 환경변수를 job 설정에 한 번 넣고, 인증서 폴더를 공유하는 방식으로 씁니다.
+
+### 인증서 수명
+
+- CA 개인키를 볼륨에 보관하지 않으므로, **dind 컨테이너를 새로 만들면 CA도 새로 만들어집니다.**
+- `client/`는 같은 볼륨이라 새 CA로 다시 서명된 인증서로 자동 갱신되고, `ci`는 그대로 동작합니다. 실측: `docker compose up -d --force-recreate dind` 후 CA 키 지문이 바뀌었고(`687b25…` → `08dcc8…`), `ci`는 재시작 없이 `docker version`에 성공했습니다.
+- 이 인증서를 compose **밖**에 복사해 두었다면, dind를 재생성한 뒤에는 다시 복사해야 합니다.
+- 오래 유지해야 하면 swarm-http처럼 `/certs` 전체를 named volume으로 보관하면 됩니다.
+
 ## 검증 결과
 
 | 확인 항목 | 결과 |

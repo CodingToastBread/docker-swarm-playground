@@ -595,9 +595,53 @@ CI 컨테이너 ──tcp://manager:2376 (TLS)──▶ manager dockerd   (swarm
                                          worker는 API 포트 없음
 ```
 
-### 사용법
+### 인증서는 어디서 만들어지나
 
-Mac에서 (인증서 경로를 플래그로 지정):
+Mac에서 만들어 컨테이너로 넣는 게 **아닙니다.** manager 컨테이너가 시작될 때 dind 이미지의 entrypoint(`dockerd-entrypoint.sh`)가 **컨테이너 안의 openssl로** 자동 생성합니다.
+
+```
+manager 컨테이너 시작
+  └─ dockerd-entrypoint.sh
+       ├─ CA 개인키/인증서 생성 (없을 때만 키 생성)
+       ├─ 서버 키/인증서 생성  → dockerd가 사용
+       └─ 클라이언트 키/인증서 생성
+  └─ dockerd 시작 (TLS 2376)
+```
+
+파일은 **컨테이너 → Mac** 방향으로 나옵니다.
+
+```
+manager: /certs              ── named volume (manager-certs) ──  Docker 내부 저장소 (Mac에서 안 보임)
+         ├── ca/     CA 개인키 (컨테이너 밖으로 나오지 않음)
+         ├── server/ dockerd용
+         └── client/ ══ bind mount ══▶ Mac: swarm-http/certs/manager-client/
+                                          ├── ca.pem    (CA 인증서: 서버를 검증할 때)
+                                          ├── cert.pem  (클라이언트 인증서)
+                                          └── key.pem   (클라이언트 개인키)
+```
+
+bind mount는 양방향이라, Mac 쪽에 `key.pem`이 이미 있으면 컨테이너가 그 키를 재사용하고 `cert.pem`만 다시 서명합니다. 그래서 `down -v`로 CA가 바뀌어도 이 디렉터리는 자동으로 새 CA에 맞게 갱신됩니다.
+
+### 인증서가 필요한 경우
+
+| 접속 방식 | 경로 | 인증서 |
+|---|---|---|
+| `docker exec manager docker ...` | manager 안에서 unix 소켓 | **필요 없음** (빠른 시작의 기본 방식) |
+| Mac에서 원격 조작 | `tcp://127.0.0.1:2376` | 필요 |
+| 다른 컨테이너 (CI 등) | `tcp://manager:2376` | 필요 |
+
+### 사용 방법
+
+docker CLI에 인증서를 알려주는 방법은 네 가지입니다. 모두 `swarm-http/` 디렉터리에서 실행한다고 가정합니다.
+
+| 방법 | 설정 범위 | 추천 상황 |
+|---|---|---|
+| ① 명령 플래그 | 그 명령 한 번 | 가끔 확인할 때 |
+| ② 환경변수 | 터미널 세션 동안 | 한동안 manager만 다룰 때 |
+| ③ docker context | Mac에 영구 등록 | 자주 쓸 때 |
+| ④ 컨테이너 환경변수 | 컨테이너 설정 | CI 컨테이너 |
+
+**① 명령 플래그**
 
 ```bash
 C=$PWD/certs/manager-client
@@ -606,15 +650,40 @@ docker -H tcp://127.0.0.1:2376 --tlsverify \
   node ls
 ```
 
-매번 플래그를 쓰기 번거로우면 docker context로 등록할 수 있습니다. 이 명령은 Mac의 `~/.docker/contexts`에 설정을 추가하므로, 원하는 경우에만 실행하세요. **이 실습에서는 실행하지 않았습니다.**
+**② 환경변수 (터미널 세션 동안)**
 
 ```bash
-docker context create swarm-http --docker \
-  "host=tcp://127.0.0.1:2376,ca=$C/ca.pem,cert=$C/cert.pem,key=$C/key.pem"
-docker --context swarm-http node ls
+export DOCKER_HOST=tcp://127.0.0.1:2376
+export DOCKER_TLS_VERIFY=1
+export DOCKER_CERT_PATH=$PWD/certs/manager-client   # ca.pem, cert.pem, key.pem이 있는 폴더
+
+docker node ls        # 플래그 없이 manager로 감
+docker service ls
+
+unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH   # 끝나면 되돌리기
 ```
 
-swarm-net에 붙은 다른 컨테이너에서 (향후 CI 형태):
+> 설정해 둔 동안에는 그 터미널의 **모든** docker 명령이 manager로 갑니다. `docker compose up`도 Docker Desktop이 아니라 manager 안의 dockerd로 가게 되니, 작업이 끝나면 꼭 `unset` 하세요.
+
+**③ docker context (한 번 등록)**
+
+```bash
+C=$PWD/certs/manager-client
+docker context create swarm-http --docker \
+  "host=tcp://127.0.0.1:2376,ca=$C/ca.pem,cert=$C/cert.pem,key=$C/key.pem"
+
+docker --context swarm-http node ls   # 이 명령만 manager로
+docker context rm swarm-http          # 필요 없어지면 삭제
+```
+
+- 명령마다 `--context swarm-http`만 붙이면 되고, 나머지 명령은 평소처럼 Docker Desktop으로 갑니다.
+- Mac의 `~/.docker/contexts`에 설정이 저장됩니다.
+- `docker context use swarm-http`로 기본값을 바꿀 수도 있지만, ②와 같은 이유로 헷갈리기 쉬워 추천하지 않습니다.
+- context는 인증서 파일 **내용**을 복사해 저장하는 것으로 알려져 있습니다 **(미검증)**. 그렇다면 `down -v`로 CA가 바뀐 뒤에는 context를 지우고 다시 만들어야 합니다.
+
+**④ 컨테이너 환경변수 (CI 형태)**
+
+swarm 네트워크에 붙이고 클라이언트 인증서를 읽기 전용으로 마운트합니다.
 
 ```bash
 docker run --rm --network swarm-http_swarm-net \
@@ -622,6 +691,18 @@ docker run --rm --network swarm-http_swarm-net \
   -e DOCKER_HOST=tcp://manager:2376 -e DOCKER_TLS_VERIFY=1 -e DOCKER_CERT_PATH=/certs/client \
   docker:29-cli docker service ls
 ```
+
+compose나 CI 도구에서는 같은 환경변수를 설정 파일에 **한 번만** 넣으면, 컨테이너 안에서는 `docker stack deploy ...`처럼 평소대로 쓸 수 있습니다. [ci-dind](../ci-dind/README.md)의 `ci` 서비스가 이 방식입니다.
+
+**검증 범위**
+- ①과 ④: 이 실습에서 실행해 확인했습니다.
+- ②: 같은 환경변수를 ④의 컨테이너 안에서 검증했고, Mac 터미널에서 직접 실행하지는 않았습니다.
+- ③: Mac 설정이 바뀌므로 실행하지 않았습니다.
+
+### 주의 사항
+
+- `certs/`에는 **클라이언트 개인키**(`key.pem`)가 있습니다. 이 파일이 있으면 manager를 root 권한으로 조작할 수 있습니다. `.gitignore`에 포함되어 있으니 커밋하지 말고, 다른 곳에 복사할 때도 주의하세요.
+- 인증서를 다른 곳(예: CI 서버)에 복사해 두었다면, `down -v` 후에는 CA가 바뀌므로 다시 복사해야 합니다([인증서 유지 방식](#인증서-유지-방식) 참고).
 
 ### 서버 인증서의 이름 (SAN)
 
