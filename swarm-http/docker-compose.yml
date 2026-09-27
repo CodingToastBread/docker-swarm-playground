@@ -4,22 +4,15 @@ services:
     container_name: manager
     hostname: manager
     privileged: true
-    # manager는 외부(Mac, 이후 CI 등)에서 원격 조작할 수 있게 Docker API를 TLS로 연다.
-    # command를 지정하지 않으면 dind entrypoint가 기본 인자를 붙인다:
-    #   --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --tlsverify ...
-    # 인증서는 /certs에 사설 CA로 자동 생성되고, 개인키가 남아 있으면 재사용한다.
-    environment:
-      DOCKER_TLS_CERTDIR: /certs
+    # docker exec(unix 소켓)로만 조작하므로 TCP API는 열지 않는다.
+    # 원격 접속(TLS)이 필요하면 README의 "선택: manager 원격 접속 (TLS)" 참고.
+    command: ["dockerd", "--host=unix:///var/run/docker.sock"]
     networks:
       swarm-net:
         ipv4_address: 172.30.0.10
-    ports:
-      - "127.0.0.1:2376:2376"   # Docker API (TLS). Mac 로컬에서만 접근 가능
     volumes:
       - ./stacks:/stacks
       - manager-data:/var/lib/docker
-      - manager-certs:/certs                    # CA/서버/클라이언트 개인키 보관 → 재생성해도 같은 키 유지
-      - ./certs/manager-client:/certs/client    # 클라이언트 인증서만 호스트로 꺼내 Mac/CI가 사용
     # 재시작 시 worker가 manager의 gossip(7946)보다 먼저 붙으면 join이 실패하고
     # 60초 주기 재시도까지 worker task가 ingress LB에 등록되지 않는다.
     # dockerd가 떠 있고, swarm 상태라면 7946까지 열린 뒤에 healthy로 판정한다.
@@ -91,6 +84,5 @@ networks:
 
 volumes:
   manager-data:
-  manager-certs:
   worker1-data:
   worker2-data:

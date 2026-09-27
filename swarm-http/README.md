@@ -8,7 +8,7 @@
 ## 구조
 
 ```
- Mac ── localhost:8080 (서비스)  localhost:8404 (HAProxy 통계)  127.0.0.1:2376 (manager API, TLS)
+ Mac ── localhost:8080 (서비스)  localhost:8404 (HAProxy 통계)
   │
   ▼
  lb (HAProxy, 172.30.0.2) ── 세 노드로 라운드로빈 + health check
@@ -24,8 +24,7 @@
 swarm-http/
 ├── docker-compose.yml     # 노드 3개 + lb
 ├── haproxy/haproxy.cfg
-├── stacks/whoami.yml      # stack 예제 (manager의 /stacks에 마운트)
-└── certs/manager-client/  # manager API 클라이언트 인증서 (자동 생성, git 제외)
+└── stacks/whoami.yml      # stack 예제 (manager의 /stacks에 마운트)
 ```
 
 ## 빠른 시작
@@ -58,7 +57,7 @@ docker exec manager docker stack rm demo                  # 정리: 서비스와
 
 # 재시작 / 초기화
 docker compose down && docker compose up -d               # swarm과 서비스 유지
-docker compose down -v                                    # 전부 삭제 (swarm, 인증서 새로 만들어짐)
+docker compose down -v                                    # 전부 삭제 (swarm을 처음부터 다시 구성)
 ```
 
 - Hostname 순서가 A → B → C로 돌지 않고 섞여 나오는 건 정상입니다([두 단계 분산](#두-단계-분산)).
@@ -78,11 +77,8 @@ docker compose down -v                                    # 전부 삭제 (swarm
 | 공통 | `image: docker:29-dind`, `privileged: true` | 컨테이너 하나를 "Docker가 설치된 서버"로 씁니다. 안쪽 dockerd가 네트워크, iptables, VXLAN을 만들려면 privileged가 필요합니다. |
 | 공통 | `hostname`, `ipv4_address` 고정 | swarm 노드 이름과 advertise 주소로 쓰입니다. 재시작 후에도 같아야 swarm 상태가 유지됩니다. |
 | 공통 | `<node>-data:/var/lib/docker` | 이미지와 swarm 상태를 볼륨에 보관해서 재시작해도 유지됩니다. |
-| manager | `command` 없음 + `DOCKER_TLS_CERTDIR: /certs` | dind 기본 동작으로 unix 소켓 + TLS 2376을 엽니다. 인증서는 자동 생성됩니다([원격 접속](#manager-원격-접속-tls)). |
-| manager | `127.0.0.1:2376:2376` | API를 Mac 로컬에만 엽니다. |
-| manager | `manager-certs:/certs`, `./certs/manager-client:/certs/client` | 개인키를 볼륨에 보관하고, 클라이언트 인증서만 Mac으로 꺼냅니다. |
 | manager | `healthcheck` | dockerd가 응답하고, swarm 상태면 gossip 포트(7946)까지 열려야 healthy입니다. |
-| worker | `command: dockerd --host=unix:///var/run/docker.sock` | API를 unix 소켓으로만 엽니다([설계 메모 3](#3-worker는-unix-소켓만-연다)). |
+| 공통 | `command: dockerd --host=unix:///var/run/docker.sock` | API를 unix 소켓으로만 엽니다([설계 메모 3](#3-docker-api는-unix-소켓만-연다)). |
 | worker | `depends_on: manager (service_healthy)` | manager의 gossip이 준비된 뒤에 시작합니다([설계 메모 2](#2-worker는-manager가-준비된-뒤-시작한다)). |
 | lb | `haproxy`, `8080:8080`, `8404:8404` | 노드에 직접 포트를 열지 않고 lb를 입구로 씁니다([설계 메모 1](#1-노드에-직접-포트를-열지-않고-haproxy를-둔다)). |
 
@@ -135,9 +131,9 @@ manager에 `8080:8080`을 직접 매핑하면 Mac의 `curl`이 **3번 중 1번�
 
 세 노드를 동시에 띄우면, worker가 manager의 gossip 포트(7946)가 열리기 직전에 접속을 시도해 실패합니다(`connection refused`). 재시도 주기가 길어서 그동안 manager는 worker의 replica를 몰라 요청이 manager replica로만 갑니다. manager `healthcheck`와 worker `depends_on`으로 순서를 보장합니다.
 
-### 3. worker는 unix 소켓만 연다
+### 3. Docker API는 unix 소켓만 연다
 
-dind 이미지는 `DOCKER_TLS_CERTDIR=""`이면 **TLS 없는 2375**를 자동으로 여는데, 이때 dockerd가 경고를 보여주려고 시작을 **일부러 늦춥니다**(`Startup is intentionally being slowed down`). worker는 원격 조작이 필요 없으므로 `command`로 unix 소켓만 엽니다. manager는 TLS(2376)라서 지연이 없습니다.
+dind 이미지는 `DOCKER_TLS_CERTDIR=""`이면 **TLS 없는 2375**를 자동으로 여는데, 이때 dockerd가 경고를 보여주려고 시작을 **일부러 늦춥니다**(`Startup is intentionally being slowed down`). 이 실습은 `docker exec`로만 조작하므로 `command`로 unix 소켓만 엽니다.
 
 재시작 시간을 더 줄이려면 서비스에 `--restart-delay 1s`를 주면 됩니다.
 
@@ -152,9 +148,32 @@ docker start manager
 - manager가 멈춰도 요청은 끊기지 않고 나머지 두 replica가 응답합니다.
 - manager가 1대라서 멈춘 동안에는 `service create/scale` 같은 관리 작업이 안 됩니다. 관리 기능까지 유지하려면 manager를 3대 이상 홀수로 둬야 합니다.
 
-## manager 원격 접속 (TLS)
+## 선택: manager 원격 접속 (TLS)
 
-`docker exec` 없이 Mac이나 다른 컨테이너(향후 CI)에서 manager를 조작할 수 있습니다. worker는 API 포트가 없습니다.
+기본 구성에서는 필요 없습니다. `docker exec` 없이 Mac이나 다른 컨테이너(향후 CI)에서 manager를 조작해야 할 때만 켭니다.
+
+### 켜는 방법
+
+`docker-compose.yml`의 manager를 다음처럼 바꿉니다. `command`를 빼면 dind 기본 동작으로 unix 소켓과 TLS 2376을 함께 엽니다.
+
+```yaml
+  manager:
+    # command: [...]                           → 삭제
+    environment:
+      DOCKER_TLS_CERTDIR: /certs               # 인증서 자동 생성
+    ports:
+      - "127.0.0.1:2376:2376"                  # Mac 로컬에만 공개
+    volumes:
+      - ./stacks:/stacks
+      - manager-data:/var/lib/docker
+      - manager-certs:/certs                   # 개인키 보관 (재생성해도 같은 키)
+      - ./certs/manager-client:/certs/client   # 클라이언트 인증서만 Mac으로 꺼냄
+
+volumes:
+  manager-certs:                               # 추가
+```
+
+`certs/`는 `.gitignore`에 포함되어 있습니다.
 
 ### 인증서
 
@@ -208,5 +227,4 @@ docker exec manager tcpdump -vvni eth0 udp port 4789                            
 docker logs worker1 2>&1 | grep -i gossip                                             # gossip join 실패 여부
 curl -s 'localhost:8404/;csv' | awk -F, '$1=="swarm_nodes"{print $2, $18}'            # HAProxy가 보는 노드 상태
 docker exec lb wget -qO- http://172.30.0.10:8080                                      # 특정 노드로 직접 요청
-docker exec manager openssl x509 -in /certs/server/cert.pem -noout -ext subjectAltName  # 서버 인증서 SAN
 ```
