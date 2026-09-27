@@ -8,17 +8,26 @@
 ## 구조
 
 ```
- Mac ── localhost:8080 (서비스)  localhost:8404 (HAProxy 통계)
-  │
-  ▼
- lb (HAProxy, 172.30.0.2) ── 세 노드로 라운드로빈 + health check
-  ├──────────────────┬──────────────────┐
-  ▼                  ▼                  ▼
- manager            worker1            worker2         ← docker:29-dind 컨테이너
- 172.30.0.10        172.30.0.11        172.30.0.12     ← 안쪽 dockerd끼리 swarm 구성
-  └ web.x            └ web.x            └ web.x        ← 서비스는 노드 "안"에서 실행
-  └────────── swarm overlay (VXLAN) ────┘
+                      Mac: curl localhost:8080
+                                  │
+                          ┌───────┴──────┐
+                          │ lb (HAProxy) │  pass to one of the nodes
+                          │ 172.30.0.2   │
+                          └───────┬──────┘
+          ┌───────────────────────┼───────────────────────┐
+          │ :8080                 │ :8080                 │ :8080
+  ┌───────┴──────┐        ┌───────┴──────┐        ┌───────┴──────┐
+  │ manager      │        │ worker1      │        │ worker2      │
+  │ 172.30.0.10  │        │ 172.30.0.11  │        │ 172.30.0.12  │
+  │ dockerd      │        │ dockerd      │        │ dockerd      │
+  │   └ web.x    │        │   └ web.x    │        │   └ web.x    │
+  └───────┬──────┘        └───────┬──────┘        └───────┬──────┘
+          └───────────────────────┴───────────────────────┘
+                   swarm overlay network (VXLAN)
 ```
+
+- Mac의 요청은 **lb(HAProxy)로 먼저 가고**, HAProxy가 세 노드 중 하나의 8080으로 넘깁니다. 노드에는 Mac에서 직접 접속하는 포트가 없습니다.
+- manager, worker1, worker2는 각각 `docker:29-dind` 컨테이너이고, 안쪽 dockerd끼리 swarm을 구성합니다. 서비스 컨테이너(`web.x`)는 노드 **안에서** 실행됩니다.
 
 ```
 swarm-http/
@@ -45,7 +54,6 @@ docker exec manager docker node ls                        # 확인: 노드 3개 
 docker exec manager docker service create --name web --replicas 3 -p 8080:80 traefik/whoami:v1.11
 docker exec manager docker service ps web                 # 확인: 노드마다 replica 1개씩
 curl localhost:8080                                       # 확인: 반복하면 Hostname이 바뀜
-                                                          # 확인: http://localhost:8404 에서 노드 3개 UP
 
 # 3. 롤링 업데이트 (다른 터미널에서 curl을 반복해 두면 요청이 끊기지 않는 걸 볼 수 있음)
 docker exec manager docker service update --image traefik/whoami:v1.12 \
@@ -87,7 +95,7 @@ docker compose down -v                                    # 전부 삭제 (swarm
 | manager | `healthcheck` | dockerd가 응답하고, swarm 상태면 gossip 포트(7946)까지 열려야 healthy입니다. |
 | 공통 | `command: dockerd --host=unix:///var/run/docker.sock` | API를 unix 소켓으로만 엽니다([설계 메모 3](#3-docker-api는-unix-소켓만-연다)). |
 | worker | `depends_on: manager (service_healthy)` | manager의 gossip이 준비된 뒤에 시작합니다([설계 메모 2](#2-worker는-manager가-준비된-뒤-시작한다)). |
-| lb | `haproxy`, `8080:8080`, `8404:8404` | 노드에 직접 포트를 열지 않고 lb를 입구로 씁니다([설계 메모 1](#1-노드에-직접-포트를-열지-않고-haproxy를-둔다)). |
+| lb | `haproxy`, `8080:8080` | 노드에 직접 포트를 열지 않고 lb를 입구로 씁니다([설계 메모 1](#1-노드에-직접-포트를-열지-않고-haproxy를-둔다)). |
 
 ### haproxy/haproxy.cfg
 
@@ -116,21 +124,54 @@ worker1:8080 ─▶ IPVS ─┬─▶ manager의 replica   (VXLAN으로 이동)
 
 HAProxy가 노드를 고르고, 그 노드의 IPVS가 replica를 다시 고릅니다. IPVS는 노드마다 순번을 따로 셉니다(health check도 순번을 가져갑니다). 그래서 순서는 섞이지만 몫은 고르게 나뉩니다.
 
-### 참고: host 모드
-
-`--publish mode=host,target=80,published=8080`을 쓰면 노드의 8080이 **자기 노드의 컨테이너에 직결**되어 노드 간 이동이 없습니다. 대신 한 노드에 replica를 하나만 둘 수 있고(보통 `--mode global`), replica가 없는 노드는 응답하지 않아서 외부 LB health check가 필수입니다. 이 실습에서는 쓰지 않았습니다.
-
 ## 설계 메모
 
 ### 1. 노드에 직접 포트를 열지 않고 HAProxy를 둔다
 
-manager에 `8080:8080`을 직접 매핑하면 Mac의 `curl`이 **3번 중 1번만 성공**합니다. manager에 있는 replica로 갈 때만 응답하고, 나머지는 응답 없이 멈춥니다.
+**manager에 `8080:8080`을 직접 연 경우:** `curl`이 3번 중 1번만 성공합니다.
 
-- **원인:** Docker Desktop 포트포워딩을 거친 패킷의 TCP 체크섬이 `0x0000`입니다. 같은 노드에서 처리하면 문제없지만, VXLAN으로 다른 노드에 넘기면 수신 노드가 체크섬 오류로 버립니다.
-  ```
-  192.168.65.1.46611 > 172.30.0.10.8080: Flags [S], cksum 0x0000 (incorrect -> 0x5241)
-  ```
-- **해결:** lb가 연결을 받아 노드로 **새 TCP 연결**을 맺습니다. 새 패킷은 정상 체크섬을 갖습니다.
+```
+ Mac: curl localhost:8080
+          │  Docker Desktop port forwarding
+          │  -> TCP checksum = 0x0000
+          │ :8080 (manager only)
+  ┌───────┴──────┐        ┌──────────────┐        ┌──────────────┐
+  │   swarm LB   │        │   swarm LB   │        │   swarm LB   │
+  └───────┬──────┘        └──────────────┘        └──────────────┘
+          ├─ VXLAN ───────────────┬─ VXLAN ───────────────┐
+          │ local: OK             X drop                  X drop
+  ┌───────┴──────┐        ┌───────┴──────┐        ┌───────┴──────┐
+  │    web.1     │        │    web.2     │        │    web.3     │
+  └──────────────┘        └──────────────┘        └──────────────┘
+      manager                 worker1                 worker2
+```
+
+Docker Desktop 포트포워딩을 거친 패킷은 TCP 체크섬이 `0x0000`입니다. 같은 노드의 replica로 가면 문제없지만, VXLAN으로 다른 노드에 넘기면 수신 노드가 체크섬 오류로 버립니다.
+
+**HAProxy를 앞에 둔 경우:** 모든 요청이 성공합니다.
+
+```
+                      Mac: curl localhost:8080
+                                  │
+                          ┌───────┴──────┐
+                          │ lb (HAProxy) │
+                          └───────┬──────┘  new TCP connection
+          ┌───────────────────────┼───────────────────────┐
+          │ :8080                 │ :8080                 │ :8080
+  ┌───────┴──────┐        ┌───────┴──────┐        ┌───────┴──────┐
+  │   swarm LB   │        │   swarm LB   │        │   swarm LB   │
+  └───────┬──────┘        └───────┬──────┘        └───────┬──────┘
+          └───────────────────────┼───────────────────────┘
+                                  │  any LB -> any replica (VXLAN): OK
+          ┌───────────────────────┼───────────────────────┐
+  ┌───────┴──────┐        ┌───────┴──────┐        ┌───────┴──────┐
+  │    web.1     │        │    web.2     │        │    web.3     │
+  └──────────────┘        └──────────────┘        └──────────────┘
+      manager                 worker1                 worker2
+```
+
+lb가 연결을 받아 노드로 **새 TCP 연결**을 맺기 때문에 패킷의 체크섬이 정상이고, VXLAN을 거쳐도 버려지지 않습니다. 세 노드로 나눠 보내므로 노드 하나가 죽어도 서비스가 유지되는 장점도 있습니다.
+
 - 컨테이너 안에서 `ethtool`로 offload를 끄거나 iptables `CHECKSUM` 규칙을 넣는 방법은 효과가 없었습니다.
 - Docker Desktop 환경의 문제로, 리눅스 Docker Engine에서는 생기지 않을 가능성이 높습니다.
 
@@ -148,7 +189,7 @@ dind 이미지는 `DOCKER_TLS_CERTDIR=""`이면 **TLS 없는 2375**를 자동으
 
 ```bash
 while true; do curl -s -m 3 localhost:8080 | grep Hostname || echo FAIL; sleep 0.5; done   # 터미널 1
-docker stop manager      # 터미널 2 → 통계 페이지에서 manager DOWN
+docker stop manager      # 터미널 2
 docker start manager
 ```
 
@@ -232,6 +273,5 @@ docker exec manager apk add -q ipvsadm tcpdump                                  
 docker exec manager nsenter --net=/var/run/docker/netns/ingress_sbox ipvsadm -Ln      # IPVS에 등록된 replica
 docker exec manager tcpdump -vvni eth0 udp port 4789                                  # VXLAN 트래픽, 체크섬
 docker logs worker1 2>&1 | grep -i gossip                                             # gossip join 실패 여부
-curl -s 'localhost:8404/;csv' | awk -F, '$1=="swarm_nodes"{print $2, $18}'            # HAProxy가 보는 노드 상태
 docker exec lb wget -qO- http://172.30.0.10:8080                                      # 특정 노드로 직접 요청
 ```

@@ -67,8 +67,7 @@ services:
       swarm-net:
         ipv4_address: 172.30.0.2
     ports:
-      - "8080:8080"   # 서비스
-      - "8404:8404"   # 통계 페이지
+      - "8080:8080"
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:
